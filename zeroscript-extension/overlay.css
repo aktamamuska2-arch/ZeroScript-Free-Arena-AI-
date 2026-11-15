@@ -424,6 +424,20 @@ button.zs-site-opt:hover .zs-site-go { opacity: 1; transform: translateX(0); }
   padding: 7px 9px; font-size: 12px; font-family: inherit; margin-bottom: 6px;
 }
 .zs-mcp-field:focus { outline: none; border-color: rgba(255, 255, 255, 0.28); }
+/* one-click preset quick-fills (Blender etc.): full-width row, name + command */
+.zs-mcp-presets { display: flex; flex-direction: column; gap: 5px; margin-bottom: 8px; }
+.zs-mcp-preset {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px; padding: 7px 10px; cursor: pointer; text-align: left;
+  font-family: inherit; transition: background 0.13s ease, border-color 0.13s ease;
+}
+.zs-mcp-preset:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.24); }
+.zs-mcp-preset-name { font-size: 12px; font-weight: 600; color: #e5e5e8; flex: none; }
+.zs-mcp-preset-cmd {
+  flex: 1; min-width: 0; text-align: right; font-size: 10px; color: #6b6b73;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* small inline spinner shown next to #zs-mcp-add while the bridge restarts */
 .zs-mcp-spin-row { display: inline-flex; align-items: center; gap: 6px; }
@@ -433,6 +447,49 @@ button.zs-site-opt:hover .zs-site-go { opacity: 1; transform: translateX(0); }
   animation: zs-mcp-spin-rotate 0.7s linear infinite;
 }
 @keyframes zs-mcp-spin-rotate { to { transform: rotate(360deg); } }
+
+/* ── consent dialog (ZeroScript-side prompt for risky model actions) ── */
+.zs-consent {
+  position: fixed; inset: 0; z-index: 2147483646;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.zs-consent-card {
+  width: min(420px, calc(100vw - 32px));
+  background: #1f2430; color: #e5e5e8;
+  border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 12px;
+  padding: 14px 16px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  font-family: inherit;
+}
+.zs-consent-t { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+.zs-consent-m { font-size: 12px; color: #c8c8ce; margin-bottom: 8px; }
+.zs-consent-pre {
+  margin: 0 0 10px; max-height: 180px; overflow: auto;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px; padding: 8px 10px;
+  font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+  color: #d7d7dd;
+}
+.zs-consent-acts { display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 8px; }
+.zs-consent-acts button {
+  font-family: inherit; font-size: 12px; padding: 6px 10px; cursor: pointer;
+  border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06); color: #e5e5e8;
+}
+.zs-consent-acts button:hover { background: rgba(255, 255, 255, 0.12); }
+.zs-consent-once { background: #2563eb !important; border-color: #2563eb !important; color: #fff !important; }
+.zs-consent-once:hover { background: #1d4ed8 !important; }
+.zs-consent-note { font-size: 10px; color: #8a8a92; }
+/* health dot while a server is starting */
+.zs-mcp-health-starting { background: #fbbf24; animation: zs-mcp-pulse 1.1s ease-in-out infinite; }
+@keyframes zs-mcp-pulse { 50% { opacity: 0.35; } }
+html.zs-light .zs-consent-card { background: #ffffff; color: #1f2430; border-color: rgba(0, 0, 0, 0.16); }
+html.zs-light .zs-consent-m { color: #4b5563; }
+html.zs-light .zs-consent-pre { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.1); color: #374151; }
+html.zs-light .zs-consent-acts button { background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.14); color: #1f2430; }
+html.zs-light .zs-consent-acts button:hover { background: rgba(0, 0, 0, 0.09); }
+html.zs-light .zs-consent-once { background: #2563eb !important; border-color: #2563eb !important; color: #fff !important; }
+html.zs-light .zs-consent-note { color: #6b7280; }
 /* ── composer mode enforcement (force Expert / DeepThink etc.) ────────────── */
 .zs-hide-el { display: none !important; }
 
@@ -990,6 +1047,10 @@ html.zs-light .zs-mcp-remove { color: #8a8a92; }
 html.zs-light .zs-mcp-remove:hover { background: rgba(0, 0, 0, 0.06); color: #1f2430; }
 html.zs-light .zs-mcp-sep { background: rgba(0, 0, 0, 0.08); }
 html.zs-light .zs-mcp-spin { border-color: rgba(0, 0, 0, 0.15); border-top-color: #4b5563; }
+html.zs-light .zs-mcp-preset { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.12); }
+html.zs-light .zs-mcp-preset:hover { background: rgba(0, 0, 0, 0.08); border-color: rgba(0, 0, 0, 0.2); }
+html.zs-light .zs-mcp-preset-name { color: #1f2430; }
+html.zs-light .zs-mcp-preset-cmd { color: #6b7280; }
 html.zs-light #zs-setup-sub { color: #4b5563; }
 html.zs-light #zs-setup-steps li { color: #374151; }
 html.zs-light #zs-setup-steps li + li { border-top-color: rgba(0, 0, 0, 0.06); }

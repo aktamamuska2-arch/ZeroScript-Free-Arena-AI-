@@ -115,6 +115,10 @@
   const A = {
     running: false,
     stop: false,
+    // Bare tool names the user allowed for the rest of THIS session via the
+    // consent dialog ("Allow all session"). Memory-only by design: consent to
+    // run code must not outlive the page.
+    execAllowedSession: new Set(),
     // stopping: the user clicked Stop and we are winding the loop down. Set the
     // instant the button is clicked so the bar can show immediate "Stopping…"
     // feedback and keep the button steady (no flicker) until the loop's finally
@@ -927,7 +931,11 @@
       const lines = servers.length
         ? servers.map((sv) => {
             const label = sv.id === "roblox" ? "Roblox Studio (primary)" : `${sv.id} (addon)`;
-            return `- ${sv.id}: ${label} - ${sv.alive ? `${sv.tools || 0} commands available` : "offline (no tools)"}`;
+            // sv.error = why the server is offline (e.g. "command not found: 'uvx'..."),
+            // reported by the bridge so the model can tell the user the FIX, not just
+            // the fact. Its suggestions stop there: never retry blindly.
+            const reason = !sv.alive && sv.error ? ` - ${sv.error}` : "";
+            return `- ${sv.id}: ${label} - ${sv.alive ? `${sv.tools || 0} commands available` : "offline (no tools)"}${reason}`;
           })
         : ["- roblox: Roblox Studio (primary) - unknown (bridge did not report server health)"];
       return (
@@ -969,6 +977,18 @@
       const scoped = A.toolList.filter((t) => (t.server || "roblox") === requested);
       if (!A.toolList.length) return `Output of '${name}':\nNo commands available - the bridge or Roblox Studio may be offline.`;
       if (!scoped.length) {
+        // Distinguish "never connected" from "configured but offline": an addon
+        // (e.g. Blender) that the user added but whose command cannot start shows
+        // up in server health with alive:false. Telling the model "no server
+        // named X" would send it chasing list_mcp_servers for a server it can
+        // already see listed - instead give it the offline reason so it can tell
+        // the user exactly what to fix (install uv, start the app, ...).
+        const srv = (A.bridge && A.bridge.servers) || [];
+        const dead = srv.find((x) => x.id === requested);
+        if (dead && !dead.alive) {
+          return `Output of '${name}':\nERROR: server "${requested}" is configured but OFFLINE (0 commands available)${dead.error ? ` - ${dead.error}` : ""}. ` +
+            `Do NOT retry now - tell the user in one short sentence how to fix it (install/start the command or its app), then run this again once they confirm.`;
+        }
         return `Output of '${name}':\nERROR: no server named "${requested}" is connected. Connected servers: ${[...known].join(", ") || "roblox"}. Call list_mcp_servers to check.`;
       }
       const lines = scoped.map((t) => {
@@ -1010,6 +1030,29 @@
     }
     if (A.toolNames.size && !A.toolNames.has(name)) {
       return ZS.FEEDBACK.unknownTool(name, [...A.toolNames]);
+    }
+    // ── Consent gate for EXECUTION-CLASS addon tools ────────────────────────
+    // Any tool that runs code on the user's machine through an ADDON server
+    // (execute_blender_code, and by shape any execute_* that is not Roblox's
+    // own execute_luau) needs an explicit user decision rendered by ZeroScript
+    // itself - never inferred from chat text, never asked "through the site".
+    // Roblox's execute_luau is intentionally NOT gated: its risk model and the
+    // user's opt-in are part of the core Roblox flow and must not change.
+    // Safe mode (preset env BLENDER_MCP_SAFE_MODE=1) is the second layer: the
+    // Blender MCP server rejects hostile Python even if a user mis-clicks.
+    const bareExec = bareToolName(name);
+    const isExecTool = bareExec.startsWith("execute_") && bareExec !== "execute_luau";
+    if (isExecTool && !A.execAllowedSession.has(bareExec)) {
+      const choice = await ui.requestConsent({
+        title: `Allow "${bareExec}"?`,
+        detail: `The AI wants to run code on your PC through an addon MCP server. Safe mode is on for Blender (hostile Python is rejected before it runs) - but read the code before allowing.`,
+        preview: String((args && (args.code || args.script)) || JSON.stringify(args) || "").slice(0, 600),
+        allowSession: true,
+      });
+      if (choice === "session") A.execAllowedSession.add(bareExec);
+      if (choice === "deny") {
+        return `ERROR: the user DENIED permission to run ${bareExec}. Do NOT retry it now and do not re-ask by another route - tell the user you need their permission for that step and continue with anything that does not need it.`;
+      }
     }
     // The Roblox MCP REQUIRES datamodel_type on execute_luau (enum Edit/Client/
     // Server). The ###LUA### parser already fills it in, but the model may also
@@ -2680,6 +2723,10 @@
         return {
           id: sv.id, name: (cached && cached.name) || sv.id, command: cached && cached.command,
           alive: sv.alive, tools: sv.tools,
+          // Why a server is offline (e.g. "command not found: 'uvx'...") - the
+          // bridge reports start errors in server health precisely so the menu
+          // can show them instead of an unexplained red dot.
+          error: sv.error || null,
         };
       });
       // Self-heal: cache didn't know about a server the bridge actually has.
@@ -2711,19 +2758,51 @@
       const clean = parts.map((p) => p.replace(/^["']|["']$/g, ""));
       return { command: clean[0] || "", args: clean.slice(1) };
     }
-    // Wait for the bridge to come back after its restart (config reload). Resolves
-    // true once reconnected (optionally once `id` shows up in server health).
-    async function waitForBridgeBack(id, timeoutMs = 15000) {
+    // Wait for the bridge to report a server (id) in its health list, or just a
+    // fresh snapshot when id is null. Resolves true once connected (optionally
+    // once `id` shows up in server health). With restartExpected=false (the live
+    // add/remove path) there is nothing to drop-and-reconnect, so the initial
+    // grace sleep is skipped and the poll starts immediately.
+    async function waitForBridgeBack(id, timeoutMs = 15000, restartExpected = true) {
       const t0 = Date.now();
-      // Give the bridge a moment to actually drop before we start polling, so we
-      // don't instantly match the pre-restart "connected" state.
-      await new Promise((r) => setTimeout(r, 1200));
+      if (restartExpected) {
+        // Give the bridge a moment to actually drop before we start polling, so we
+        // don't instantly match the pre-restart "connected" state.
+        await new Promise((r) => setTimeout(r, 1200));
+      }
       while (Date.now() - t0 < timeoutMs) {
         const s = await bg({ type: "status" });
         if (s && s.connected) {
           if (!id || (Array.isArray(s.servers) && s.servers.some((x) => x.id === id))) return true;
         }
         await new Promise((r) => setTimeout(r, 700));
+      }
+      return false;
+    }
+
+    // Wait until server `id` leaves the starting phase (ready OR failed with a
+    // reason). Bridges that don't report `starting` (old versions) resolve as
+    // soon as the id appears - previous behaviour. Returns the final snapshot.
+    async function waitForServerSettle(id, timeoutMs = 60000) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const s = await bg({ type: "status" });
+        const servers = (s && Array.isArray(s.servers)) ? s.servers : [];
+        const sv = servers.find((x) => x.id === id);
+        if (sv && sv.starting !== true) return sv;
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      return null;
+    }
+
+    // Wait until server `id` vanishes from server health (live removal).
+    async function waitForServerGone(id, timeoutMs = 10000) {
+      const t0 = Date.now();
+      while (Date.now() - t0 < timeoutMs) {
+        const s = await bg({ type: "status" });
+        const servers = (s && Array.isArray(s.servers)) ? s.servers : [];
+        if (!servers.some((x) => x.id === id)) return true;
+        await new Promise((r) => setTimeout(r, 400));
       }
       return false;
     }
@@ -2748,6 +2827,12 @@
       }
       const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       const mergedServers = mergedMcpServers();
+      // One-click quick-fills for known addon servers (Blender first). Filling
+      // - not auto-adding - keeps "Add server" the single explicit act.
+      let presetsRow = "";
+      for (const p of (ZS.MCP_PRESETS || [])) {
+        presetsRow += `<button class="zs-mcp-preset" data-preset="${esc(p.id)}"><span class="zs-mcp-preset-name">${esc(p.name)}</span><span class="zs-mcp-preset-cmd">${esc(p.command)}</span></button>`;
+      }
       // Roblox always heads the list - greyed out, no health dot (its own status
       // is already the main ZeroScript dot elsewhere) and no remove button (it's
       // the primary server, protected bridge-side too).
@@ -2756,9 +2841,15 @@
       mergedServers.forEach((s, i) => {
         // alive === undefined -> the bridge hasn't reported this server's health
         // yet (just added/removed, still restarting) - shown neutral, not red.
-        const healthClass = s.alive === true ? "on" : s.alive === false ? "off" : "unknown";
-        const healthTitle = s.alive === true ? `${s.tools || 0} tools available` : s.alive === false ? "offline" : "status unknown";
-        mcpList += `<div class="zs-mcp-item"><span class="zs-mcp-health zs-mcp-health-${healthClass}" title="${healthTitle}"></span><div class="zs-mcp-info"><span class="zs-mcp-name">${esc(s.name)}</span><span class="zs-mcp-url">${esc(s.command || s.id)}</span></div><button class="zs-mcp-remove" data-id="${esc(s.id)}" title="Remove">✕</button></div>`;
+        // A start failure (s.error) rides along in the tooltip: a red dot that
+        // names its reason ("command not found: 'uvx' ...") is actionable, a
+        // bare red dot is just noise.
+        const healthClass = s.starting === true ? "starting" : s.alive === true ? "on" : s.alive === false ? "off" : "unknown";
+        const healthTitle = (s.starting === true ? "starting…"
+                            : s.alive === true ? `${s.tools || 0} tools available`
+                            : s.alive === false ? "offline" : "status unknown")
+                            + (s.error ? ` - ${s.error}` : "");
+        mcpList += `<div class="zs-mcp-item"><span class="zs-mcp-health zs-mcp-health-${healthClass}" title="${esc(healthTitle)}"></span><div class="zs-mcp-info"><span class="zs-mcp-name">${esc(s.name)}</span><span class="zs-mcp-url">${esc(s.command || s.id)}</span></div><button class="zs-mcp-remove" data-id="${esc(s.id)}" title="Remove">✕</button></div>`;
       });
       menuEl.innerHTML =
         `<div class="zs-menu-head"><span class="zs-menu-logo">ZeroScript</span><span class="zs-menu-tag">v${EXT_VERSION}</span></div>
@@ -2785,11 +2876,12 @@
          </section>
          <section class="zs-menu-sec">
            <div class="zs-sec-label"><span>MCP servers</span></div>
-           <div class="zs-menu-note">Roblox Studio is always connected (primary). Add another MCP server (e.g. Blender, Sketchfab) as an addon - the bridge restarts briefly to load it. Experimental.</div>
+           <div class="zs-menu-note">Roblox Studio is always connected (primary). Add another MCP server (e.g. Blender) as an addon - it connects live, no restart needed. Experimental.</div>
            ${mcpList}
            <div class="zs-mcp-sep"></div>
+           ${presetsRow ? `<div class="zs-mcp-presets">${presetsRow}</div>` : ""}
            <input id="zs-mcp-name" class="zs-mcp-field" placeholder="Name, e.g. Blender" />
-           <input id="zs-mcp-url" class="zs-mcp-field" placeholder="Start command, e.g. npx -y @some/mcp-server" />
+           <input id="zs-mcp-url" class="zs-mcp-field" placeholder="Start command, e.g. uvx mcp-for-blender" />
            <div class="zs-set-row"><button id="zs-mcp-add">Add server</button><span id="zs-mcp-status"></span></div>
          </section>`;
       const open = (url) => { try { window.open(url, "_blank", "noopener"); } catch {} menuEl.hidden = true; };
@@ -2809,61 +2901,136 @@
       const mcpUrlEl = menuEl.querySelector("#zs-mcp-url");
       const mcpStatus = menuEl.querySelector("#zs-mcp-status");
       const mcpAddBtn = menuEl.querySelector("#zs-mcp-add");
-      // Disable every add/remove control and show the restart spinner. Adding or
-      // removing a server rewrites config.json and restarts the whole bridge, so
-      // no other server edit may run until it is back.
+      // Disable every add/remove control and show the spinner. Adding or removing
+      // a server now happens LIVE on the bridge (config.json write + start/stop of
+      // just that client), so no other server edit may run until it settles.
       let mcpBusy = false;
       function setMcpBusy(on, label) {
         mcpBusy = on;
         mcpAddBtn.disabled = on;
         menuEl.querySelectorAll(".zs-mcp-remove").forEach((b) => (b.disabled = on));
         mcpStatus.innerHTML = on
-          ? `<span class="zs-mcp-spin-row"><span class="zs-mcp-spin"></span>${label || "Restarting bridge…"}</span>`
+          ? `<span class="zs-mcp-spin-row"><span class="zs-mcp-spin"></span>${label || "Connecting…"}</span>`
           : "";
       }
+      function flashMcpStatus(text, ms) {
+        mcpStatus.textContent = text;
+        setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, ms || 2400);
+      }
+
+      // Preset quick-fill: fills the two inputs with a known-good addon spec.
+      // It deliberately does NOT auto-add: the command may need a local tweak
+      // (port, python version pin), and pressing "Add server" stays the single
+      // explicit, reversible act. The note carries the real-world prerequisites
+      // (uv installed, the in-app addon enabled) that the health dot cannot.
+      let pendingPresetEnv = null; // env of the last preset clicked (sent with add_server)
+      menuEl.querySelectorAll(".zs-mcp-preset").forEach((b) =>
+        b.addEventListener("click", () => {
+          if (mcpBusy) return;
+          const p = (ZS.MCP_PRESETS || []).find((x) => x.id === b.dataset.preset);
+          if (!p) return;
+          mcpNameEl.value = p.name;
+          mcpUrlEl.value = p.command;
+          pendingPresetEnv = p.env || null;
+          flashMcpStatus("Filled in - press Add server (twice: the second click confirms). " + p.note, 12000);
+        }));
 
       menuEl.querySelectorAll(".zs-mcp-remove").forEach((b) =>
         b.addEventListener("click", async () => {
           if (mcpBusy) return;
           const id = b.dataset.id;
           if (!id) return;
-          setMcpBusy(true, "Restarting bridge…");
+          // Two-click confirm for removal too: it stops a process the user
+          // deliberately added, so a stray single click must not kill it.
+          if (b.dataset.confirmArmed !== "1") {
+            b.dataset.confirmArmed = "1";
+            b.textContent = "!";
+            flashMcpStatus(`Click again to confirm removing "${id}".`, 6000);
+            setTimeout(() => { if (b.isConnected) { b.dataset.confirmArmed = ""; b.textContent = "✕"; } }, 6000);
+            return;
+          }
+          setMcpBusy(true, "Removing…");
           const r = await bg({ type: "remove_server", server_id: id });
           if (!r || !r.ok) {
             setMcpBusy(false);
-            mcpStatus.textContent = (r && r.error) || "Couldn't remove server";
-            setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, 2400);
+            flashMcpStatus((r && r.error) || "Couldn't remove server");
             return;
           }
           customMcpServers = customMcpServers.filter((s) => s.id !== id);
           saveCustomMcpServers();
-          await waitForBridgeBack(null);
+          if (r && r.restarting === false) {
+            // Live remove: wait until the id disappears from server health.
+            await waitForServerGone(id, 10000);
+          } else {
+            // Legacy bridge: it restarts itself; wait for the reconnect.
+            await waitForBridgeBack(null, 15000, true);
+          }
           buildMenu(); // rebuilds with the spinner cleared
+          if (r.warning) flashMcpStatus(r.warning, 6000);
         }));
 
+      // Two-click confirm: add/remove spawn a process on the user's machine,
+      // so the FIRST click only arms an explicit confirm state (shown bridge/
+      // extension side, never through the AI site) and the SECOND click - on
+      // the same control, within 6s - is the consent that actually sends it.
+      let addConfirmArmed = false, addConfirmTimer = null;
+      function disarmAddConfirm() {
+        addConfirmArmed = false;
+        clearTimeout(addConfirmTimer);
+        if (mcpAddBtn) mcpAddBtn.textContent = "Add server";
+      }
       mcpAddBtn.addEventListener("click", async () => {
         if (mcpBusy) return;
         const name = mcpNameEl.value.trim();
         const command = mcpUrlEl.value.trim();
         if (!name || !command) {
-          mcpStatus.textContent = "Name and command required";
-          setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, 1800);
+          flashMcpStatus("Name and command required", 1800);
           return;
         }
+        const { command: cmd0 } = splitCommand(command);
+        if (!addConfirmArmed) {
+          addConfirmArmed = true;
+          mcpAddBtn.textContent = `Confirm: run "${cmd0}"`;
+          flashMcpStatus("Click again to confirm - this command will run on your PC.", 6000);
+          addConfirmTimer = setTimeout(disarmAddConfirm, 6000);
+          return;
+        }
+        disarmAddConfirm();
         const id = mcpSlug(name);
         const { command: cmd, args } = splitCommand(command);
-        setMcpBusy(true, "Restarting bridge…");
-        const r = await bg({ type: "add_server", server_id: id, command: cmd, args });
+        // Client-side heads-up (the bridge still validates authoritatively and
+        // reports start failures in server health): uvx-based servers need `uv`
+        // installed, and their FIRST connect can take a minute while uv downloads
+        // the package - shown in the spinner label so it isn't mistaken for a hang.
+        const needsUv = /^uvx?\b/i.test(cmd);
+        setMcpBusy(true, needsUv
+          ? "Connecting… (uvx: first connect can take a minute while uv downloads the server)"
+          : "Connecting…");
+        const r = await bg({ type: "add_server", server_id: id, command: cmd, args,
+                              env: pendingPresetEnv || undefined });
+        pendingPresetEnv = null;
         if (!r || !r.ok) {
           setMcpBusy(false);
-          mcpStatus.textContent = (r && r.error) || "Couldn't add server";
-          setTimeout(() => { if (!mcpBusy) mcpStatus.textContent = ""; }, 2400);
+          flashMcpStatus((r && r.error) || "Couldn't add server");
           return;
         }
         customMcpServers.push({ id, name, command });
         saveCustomMcpServers();
-        await waitForBridgeBack(id);
-        buildMenu(); // rebuilds with the new server listed + spinner cleared
+        // Live add: the bridge acks immediately (server visible in health with
+        // starting:true) and pushes a broadcast the moment the start settles.
+        // Wait for the SETTLE, not just the appearance, so the spinner
+        // truthfully covers the whole starting phase and ends in ready/failed.
+        if (r && r.restarting === false) {
+          const settled = await waitForServerSettle(id, 60000);
+          buildMenu(); // rebuilds with the new server listed + spinner cleared
+          if (settled && settled.alive === false && settled.error) {
+            flashMcpStatus(`Failed: ${settled.error}`, 12000);
+          }
+        } else {
+          // Legacy bridge path: it restarts itself; wait for the reconnect.
+          await waitForBridgeBack(id, 20000, true);
+          buildMenu();
+        }
       });
     }
 

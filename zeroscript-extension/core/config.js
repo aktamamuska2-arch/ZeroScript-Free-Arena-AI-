@@ -321,7 +321,66 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
       "required'. Later steps may omit x/y and reuse the last position (click then scroll at the same spot). " +
       "mouseButtonDown/Up/Click need \"mouse_button\":\"left\" or \"right\". A \"wait\" step needs \"wait_time_ms\" (0-10000). " +
       "Example: {\"datamodel_type\":\"Client\",\"actions\":[{\"action\":\"mouseButtonClick\",\"mouse_button\":\"left\",\"instance_path\":\"LocalPlayer.PlayerGui.Menu.PlayBtn\"}]}.",
+    // ── Addon server (Blender etc.) notes - keyed by bare name, so they only
+    // render when that server is actually connected. Tool list and risk
+    // grouping validated against mcp-for-blender 2.3.0 (ahujasid), the
+    // maintained successor of blender-mcp. Risk groups (re-check on pin bump):
+    //   LOW  read-only: get_scene_info, get_addon_status, search_assets,
+    //        search_mentions, look, viewport_latest, viewport_pick,
+    //        viewport_capture, record_trajectory_feedback, disable_telemetry
+    //   MED  scene/network writes: import_asset, generate_3d,
+    //        generate_gaussian_world (external services, may cost money)
+    //   HIGH arbitrary code: execute_blender_code (consent-gated by ZeroScript,
+    //        runs under the package's safe mode - see README)
+    execute_blender_code:
+      "HIGH RISK - runs Python (bpy) inside the user's LIVE Blender. ZeroScript shows a consent dialog first; the server's " +
+      "safe mode rejects eval/exec/os/subprocess/network/persistence, but scene changes are still real and there is NO " +
+      "automatic undo step (the add-on does not wrap calls in one). Whatever the code PRINTS is returned (print is captured " +
+      "here, unlike Roblox's execute_luau). Work in small steps, print what you need to know, confirm scope with the user " +
+      "before large deletions, and remind them to save their .blend first. Long ops (render/bake) block the whole call.",
+    get_scene_info:
+      "LOW RISK read-only: compact one-line-per-object summary of the user's Blender scene - prefer it over " +
+      "execute_blender_code for reading structure. For what the camera sees use look / viewport_latest.",
+    import_asset:
+      "MEDIUM RISK: downloads an asset (PolyHaven etc.) and inserts it into the user's scene - a network fetch plus a " +
+      "scene modification. Search first with search_assets, prefer LOW-RISK reads to verify the result after import.",
+    generate_3d:
+      "MEDIUM RISK: calls an EXTERNAL generative service (network, may need API credits) and inserts the result into the " +
+      "scene. Confirm the user actually wants generated content before calling; verify the result with get_scene_info.",
+    generate_gaussian_world:
+      "MEDIUM RISK: calls an EXTERNAL generative service to build a gaussian-splat world (network, may need API credits) " +
+      "and loads it in Blender. Confirm with the user first; generation can be slow and blocks the call.",
   };
+
+  // ── One-click addon MCP presets (the menu's "Add server" quick-fills) ──────
+  // Each preset fills the name + command inputs; the user still presses Add
+  // (twice - the second click confirms the exact command). `env` is sent with
+  // the add_server request so the addon's own safety knobs are ON by default:
+  //   - BLENDER_MCP_SAFE_MODE=1 turns on mcp-for-blender's AST allowlist
+  //     validator (verified in its source, v2.3.0): execute_blender_code
+  //     scripts are rejected before reaching Blender unless they only import
+  //     bpy/bmesh/mathutils/pure-python stdlib - no eval/exec/os/subprocess/
+  //     network/persistence. Only the user can turn it off (delete the env).
+  //   - DISABLE_TELEMETRY=true keeps the package's optional data collection
+  //     off regardless of its in-app consent checkbox (env verified in
+  //     telemetry.py of the same version).
+  const MCP_PRESETS = [
+    {
+      id: "blender",
+      name: "Blender",
+      // Version-PINNED (2.3.0 = latest on PyPI, verified 2026-11-15): a pin
+      // keeps every start identical instead of resolving "latest" and hoping.
+      // TO UPDATE THE PIN: bump the @version here after checking the release
+      // notes at github.com/ahujasid/mcp-for-blender (package renamed from
+      // blender-mcp; both resolve, this is the maintained one).
+      command: "uvx mcp-for-blender@2.3.0",
+      env: { BLENDER_MCP_SAFE_MODE: "1", DISABLE_TELEMETRY: "true" },
+      note: "Needs the uv package manager (uvx) installed, and the MCP for Blender add-on enabled in Blender " +
+            "(Edit > Preferences > Add-ons > 'Interface: MCP for Blender', then start its connection in the sidebar). " +
+            "Safe mode is ON (hostile Python is rejected before it reaches Blender); keep Blender open while using it. " +
+            "Save your .blend before letting the AI edit.",
+    },
+  ];
 
   // A short, clearly-labelled reminder of the available commands, injected under
   // a tool result every so often so the model does not drift from the exact
@@ -363,5 +422,6 @@ IMPORTANT: Your very first action is to write \`list_commands\` with no params (
     toolsReminder,
     memoryNudge,
     TOOL_NOTES,
+    MCP_PRESETS,
   };
 })();
