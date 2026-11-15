@@ -19,9 +19,12 @@
 #     Nothing ever hangs the agentic loop silently.
 # ──────────────────────────────────────────────────────────────────────────
 import asyncio
+import hmac
 import json
 import os
 import queue
+import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -664,20 +667,135 @@ def _write_config(cfg):
     os.replace(tmp, CONFIG_PATH)
 
 
+# ── Addon server validation (extension-driven add/remove) ──────────────────
+# The add_server message comes over the local socket with whatever strings the
+# extension UI collected. Before any of it lands in config.json (and later in
+# subprocess.Popen / the process env), it is validated here. STRICT: malformed
+# input is rejected with a precise error, never silently coerced into
+# something else - a silently "fixed" spec would hide a UI bug and could turn
+# an unexpected type into an executable argument.
+# This is addon-only by construction: config_add_server refuses the primary
+# (roblox) server, so none of it can change how the Roblox proxy launches.
+def _SID_RE():
+    # Lower-case slugs only - the id is used as a dict key, in "sid/toolname"
+    # collision prefixes, in the UI's health list, and in log lines. Allowing
+    # spaces/slashes/upper-case would make those surfaces ambiguous (a "/" in
+    # an id would make its tools indistinguishable from another server's).
+    return re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _ENV_KEY_RE():
+    # env var names must be valid on both Windows and POSIX: letters, digits,
+    # underscores (dots are invalid on Windows and would fail Popen env use).
+    return re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+_MAX_SERVER_CMD_LEN = 2048
+_MAX_SERVER_ARGS = 64
+_MAX_SERVER_ENV = 64
+
+
+def _clean_server_str(value, what):
+    """Return (str_value, None) or (None, error). Accepts ONLY real strings and
+    rejects control characters - a newline inside a command/arg/env value would
+    silently split a Popen argument or corrupt config.json's line-oriented
+    readability for no reason. Numbers and other types are the CALLER's bug:
+    they get a clear error instead of a silent str() coercion."""
+    if not isinstance(value, str):
+        return None, f"{what} must be a string (got {type(value).__name__})"
+    if "\n" in value or "\r" in value or "\x00" in value or any(ord(c) < 32 for c in value):
+        return None, f"{what} contains control characters"
+    return value, None
+
+
+def validate_server_spec(server_id, command, args=None, env=None):
+    """Validate an addon server spec from the extension. STRICT, no coercion.
+
+    Returns (spec, None) on success - spec is {"server_id", "command", "args",
+    "env"} with args/env already guaranteed to be the exact shapes config.json
+    and subprocess.Popen expect - or (None, error_message) naming the first
+    problem. args must be a list of strings, env an object whose keys and
+    values are both strings; anything else is an error, never a conversion.
+    """
+    sid = str(server_id or "").strip() if isinstance(server_id, str) else ""
+    if not sid:
+        return None, "server id is required"
+    if sid == PRIMARY_SERVER_ID:
+        return None, f"'{PRIMARY_SERVER_ID}' is the primary server and cannot be edited"
+    if not _SID_RE().match(sid):
+        return None, ("server id must be 1-64 chars: lower-case letters, digits, "
+                      "dots, dashes or underscores, starting with a letter or digit")
+
+    command, err = _clean_server_str(command, "command")
+    if err:
+        return None, err
+    command = command.strip()
+    if not command:
+        return None, "a command is required"
+    if len(command) > _MAX_SERVER_CMD_LEN:
+        return None, "command is too long"
+
+    if args is None or args == []:
+        norm_args = []
+    elif isinstance(args, (list, tuple)):
+        if len(args) > _MAX_SERVER_ARGS:
+            return None, f"too many arguments (max {_MAX_SERVER_ARGS})"
+        norm_args = []
+        for i, a in enumerate(args):
+            a, err = _clean_server_str(a, f"argument {i + 1}")
+            if err:
+                return None, err
+            norm_args.append(a)
+    else:
+        return None, f"args must be a list of strings (got {type(args).__name__})"
+
+    if env is None or env == {}:
+        norm_env = {}
+    elif isinstance(env, dict):
+        if len(env) > _MAX_SERVER_ENV:
+            return None, f"too many env vars (max {_MAX_SERVER_ENV})"
+        norm_env = {}
+        for k, v in env.items():
+            if not isinstance(k, str) or not _ENV_KEY_RE().match(k):
+                return None, f"env var name '{k}' is not a valid environment variable name"
+            v, err = _clean_server_str(v, f"env var {k}")
+            if err:
+                return None, err
+            norm_env[k] = v
+    else:
+        return None, f"env must be an object of name -> value (got {type(env).__name__})"
+
+    return ({"server_id": sid, "command": command, "args": norm_args, "env": norm_env}, None)
+
+
 def config_add_server(server_id, command, args=None, env=None):
     """Add/replace an addon server in config.json. Refuses to touch the primary
-    (roblox) server. Returns (ok, error)."""
-    sid = (server_id or "").strip()
+    (roblox) server. Returns (ok, error).
+
+    Callers MUST pass specs through validate_server_spec first - this function
+    persists the shapes it is given (all strings) and re-checks only the two
+    invariants that must hold unconditionally (primary server, non-empty
+    command) as defense in depth.
+    """
+    sid = (server_id or "").strip() if isinstance(server_id, str) else ""
     if not sid:
         return False, "server id is required"
     if sid == PRIMARY_SERVER_ID:
         return False, f"'{PRIMARY_SERVER_ID}' is the primary server and cannot be edited"
-    if not (command or "").strip():
+    if not isinstance(command, str) or not command.strip():
         return False, "a command is required"
+    if args is None:
+        args = []
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return False, "args must be a list of strings"
+    if env is None:
+        env = {}
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        return False, "env must be an object of string -> string"
     cfg = _read_config()
-    spec = {"command": command.strip(), "args": list(args or [])}
+    spec = {"command": command.strip(), "args": args}
     if env:
-        spec["env"] = dict(env)
+        spec["env"] = env
     cfg["mcpServers"][sid] = spec
     try:
         _write_config(cfg)
@@ -700,6 +818,130 @@ def config_remove_server(server_id):
     except Exception as e:
         return False, f"could not write config.json: {e}"
     return True, None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  BRIDGE AUTHENTICATION
+#
+#  The bridge listens on ws://127.0.0.1:<PORT>. Binding to loopback keeps REMOTE
+#  hosts out, but on a multi-user machine every local session can still reach
+#  the port - and, critically, ANY PAGE OPEN IN THE USER'S BROWSER can attempt a
+#  WebSocket to 127.0.0.1 from an http page (CORS does NOT protect WebSocket
+#  handshakes; the browser sets the Origin header but the server must enforce
+#  it - websockets 17.x accepts any Origin by default, verified live). Before
+#  authentication, such a page could call add_server (arbitrary process
+#  execution) or call_tool (drive Studio/Blender).
+#
+#  Three independent gates, cheapest first:
+#    1. HTTP handshake gate (process_request): Origin allowlist + Host check.
+#       A web page CANNOT forge its Origin header (browser-controlled), so
+#       this alone closes the web-page attack. Host must be the loopback
+#       literal we bound - a DNS-rebinding page arrives with a foreign Host
+#       and is rejected before upgrade.
+#    2. Token: every WS connection must send {"type":"hello","token":...} as
+#       its FIRST message; anything else is closed (4001) before a single
+#       request is processed. The token is a per-install 256-bit random hex
+#       stored in bridge_auth.json (0600 on POSIX) and compared in constant
+#       time. Rotation: POST /zs-auth/rotate (Origin-gated) -> new token,
+#       every authed connection closed (4002) so stale tokens die instantly.
+#    3. Extension-only token delivery: GET /zs-auth-token serves the token
+#       ONLY to clients whose Origin matches the extension allowlist AND with
+#       no CORS headers, so a web page cannot read the response (the MV3
+#       service worker can - host_permissions for http://127.0.0.1/* bypass
+#       CORS for extensions).
+#
+#  HONEST SCOPE: a process running as the SAME user can read bridge_auth.json
+#  or spoof an Origin header - no loopback scheme short of an OS-enforced
+#  channel (native messaging) defends against that, and it is documented as a
+#  residual risk, not a guarantee.
+# ══════════════════════════════════════════════════════════════════════════
+AUTH_FILE = os.path.join(HERE, "bridge_auth.json")
+AUTH_TOKEN_ENV = "ZS_AUTH_TOKEN"
+HELLO_TIMEOUT_S = 10
+# Browsers enforce the Origin header on behalf of pages: a web page cannot set
+# it to chrome-extension://..., an extension service worker sends exactly that.
+# 32 chars of [a-p] is the Chromium/Edge extension-id shape (new-style ids are
+# still 32 a-p letters). Anything else (http(s)://, null, file://) is a page.
+EXT_ORIGIN_RE = re.compile(r"chrome-extension://[0-9a-p]{32}")
+
+
+def _ct_equal(a, b):
+    """Constant-time comparison for token checks. FAILS CLOSED: anything that
+    is not a non-empty string on either side is unequal - a missing/malformed
+    token must never accidentally compare equal to an empty configured token."""
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return False
+    return hmac.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8", "replace"))
+
+
+def _auth_new_token():
+    return secrets.token_hex(32)
+
+
+def _auth_write(token):
+    """Persist the token. 0600 on POSIX; on Windows os.chmod only toggles the
+    read-only bit - the profile-scoped ACL is the effective boundary there and
+    is documented as such (see the residual-risk note above)."""
+    data = json.dumps({"token": token, "created": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    try:
+        fd = os.open(AUTH_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        try:
+            os.chmod(AUTH_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"could not write {AUTH_FILE}: {e} - auth cannot persist", "rd")
+        return False
+    return True
+
+
+def _auth_load_or_create():
+    """Return the active token, loading bridge_auth.json (creating it when
+    missing/corrupt). ZS_AUTH_TOKEN overrides the file entirely, for headless
+    setups where the extension cannot fetch over HTTP either."""
+    env_token = os.environ.get(AUTH_TOKEN_ENV, "").strip()
+    if env_token:
+        log(f"auth: using token from {AUTH_TOKEN_ENV} (file ignored)", "cy")
+        return env_token
+    try:
+        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        token = data.get("token")
+        if isinstance(token, str) and len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+            return token
+        log("auth: bridge_auth.json is malformed - generating a fresh token", "yl")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"auth: could not read {AUTH_FILE} ({e}) - generating a fresh token", "yl")
+    token = _auth_new_token()
+    if _auth_write(token):
+        log(f"auth: generated a new per-install token ({AUTH_FILE}, fingerprint {token[:8]}...)", "cy")
+    return token
+
+
+def _auth_rotate():
+    """Replace the token and return it. Every currently-authed connection is
+    closed with 4002 by the rotate endpoint right after this returns, so a
+    rotated/revoked token dies everywhere at once. Updates the in-memory token
+    too - the hello gate compares against it, so a rotation that only touched
+    the file would leave the old token valid until the next bridge restart."""
+    global bridge_auth_token
+    token = _auth_new_token()
+    _auth_write(token)
+    bridge_auth_token = token
+    log(f"auth: token rotated (new fingerprint {token[:8]}...) - existing connections will be closed", "yl")
+    return token
+
+
+# Populated by handler() after a successful hello; event-loop-confined (every
+# mutation and every read happens on the asyncio loop thread - never from the
+# worker threads), so no lock is needed; a comment here is the invariant, the
+# rate limiter and the rotation path are the users.
+authed_conns = set()
+
 
 
 def restart_self():
@@ -784,6 +1026,10 @@ class MCPClient:
         # grabs the port a moment after boot (seen live 2026-07-13: ropilot took
         # the port ~1s after the boot check ran, so nothing was flagged).
         self.saw_foreign_ws_host = False
+        # True between start() entry and its settle (success OR failure). The
+        # extension's server-health UI drives its "Connecting…" spinner off this
+        # instead of guessing, and flips to ready/failed when it clears.
+        self.starting = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def _resolve(self, s):
@@ -793,29 +1039,86 @@ class MCPClient:
         with self.start_lock:
             if self.is_alive():
                 return
-            cmd = [self._resolve(self.command)] + [self._resolve(a) for a in self.args]
-            # A bare .py command (relative paths resolve against the bridge dir)
-            # is run with the SAME interpreter the bridge itself uses, so it works
-            # even on installs where only the `py` launcher exists (no `python`
-            # on PATH). This is how the Studio MCP launcher is wired by default.
-            if cmd[0].lower().endswith(".py"):
-                script = cmd[0]
-                if not os.path.isabs(script):
-                    script = os.path.join(HERE, script)
-                cmd = [sys.executable, script] + cmd[1:]
-            # On Windows, npx/npm/yarn/pnpm/bunx are .cmd shims that Popen can't
-            # launch directly (WinError 2). Run them through cmd.exe so any
-            # node-based MCP server "just works" from config.json.
-            if sys.platform == "win32":
+            self.starting = True
+            try:
+                self._start_locked()
+            except Exception as e:
+                # Record the failure so health() and the extension's failed
+                # state NAME the reason (previously only the bridge log line
+                # carried it). Enrich silent deaths (EOF during the initialize
+                # handshake) with the exit code + first stderr line.
+                if self.start_error is None:
+                    msg = str(e) or e.__class__.__name__
+                    # The reader thread may not have observed the EOF yet when
+                    # the write side fails first - give it a moment so the
+                    # reason can carry the exit code + stderr (diagnostic wait
+                    # on the failure path only, success path unchanged).
+                    for _ in range(40):
+                        if not self.is_alive() and self.last_exit is not None:
+                            break
+                        time.sleep(0.05)
+                    if not self.is_alive() and self.last_exit is not None:
+                        first_err = self.stderr_tail[0] if self.stderr_tail else ""
+                        msg += (f" (process exited with code {self.last_exit}"
+                                f"{': ' + first_err if first_err else ''})")
+                    self.start_error = msg
+                raise
+            finally:
+                self.starting = False
+
+    def _start_locked(self):
+        """Body of start() while start_lock is held and starting=True."""
+        cmd = [self._resolve(self.command)] + [self._resolve(a) for a in self.args]
+        # A bare .py command (relative paths resolve against the bridge dir)
+        # is run with the SAME interpreter the bridge itself uses, so it works
+        # even on installs where only the `py` launcher exists (no `python`
+        # on PATH). This is how the Studio MCP launcher is wired by default.
+        if cmd[0].lower().endswith(".py"):
+            script = cmd[0]
+            if not os.path.isabs(script):
+                script = os.path.join(HERE, script)
+            cmd = [sys.executable, script] + cmd[1:]
+        # On Windows, npx/npm/yarn/pnpm/bunx are .cmd shims that Popen can't
+        # launch directly (WinError 2). Run them through cmd.exe so any
+        # node-based MCP server "just works" from config.json.
+        if sys.platform == "win32":
+            base = os.path.basename(cmd[0]).lower()
+            if base in ("npx", "npm", "yarn", "pnpm", "bunx"):
+                cmd = ["cmd.exe", "/c"] + cmd
+        env = dict(os.environ)
+        for k, v in self.env.items():
+            env[k] = self._resolve(v)
+        log(f"[{self.id}] launching  ({' '.join(cmd)})", "cy")
+        with _Spinner(f"    [{self.id}] starting..."):
+            try:
+                self.proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=HERE,
+                    env=env,
+                )
+            except FileNotFoundError:
+                # uvx/uv are commonly installed into a per-user bin directory
+                # that IS on the user's PATH in shells but NOT in the minimal
+                # environment of a process launched by double-clicking
+                # start.bat (Explorer passes the user PATH, but corporate
+                # images / terminal-app launches sometimes don't; uv also
+                # post-dates many users' PATH edits). Before giving up, scan
+                # the standard install locations; only if that fails too do
+                # we raise, with an actionable message naming the fix.
+                resolved = None
                 base = os.path.basename(cmd[0]).lower()
-                if base in ("npx", "npm", "yarn", "pnpm", "bunx"):
-                    cmd = ["cmd.exe", "/c"] + cmd
-            env = dict(os.environ)
-            for k, v in self.env.items():
-                env[k] = self._resolve(v)
-            log(f"[{self.id}] launching  ({' '.join(cmd)})", "cy")
-            with _Spinner(f"    [{self.id}] starting..."):
-                try:
+                if base in ("uvx", "uv", "uvx.exe", "uv.exe"):
+                    resolved = self._resolve_uvx()
+                if resolved:
+                    log(f"[{self.id}] '{cmd[0]}' not on PATH - resolved to {resolved}", "yl")
+                    cmd[0] = resolved
                     self.proc = subprocess.Popen(
                         cmd,
                         stdin=subprocess.PIPE,
@@ -828,55 +1131,94 @@ class MCPClient:
                         cwd=HERE,
                         env=env,
                     )
-                except FileNotFoundError:
+                else:
                     # The OS couldn't find cmd[0] at all - this is a config
                     # problem (missing dependency, typo, not on PATH), not a
                     # transient crash. Auto-restart will keep retrying (the
                     # user may install it later), but name the real cause so
                     # it doesn't just look like an endless silent restart loop.
+                    hint = ""
+                    if base in ("uvx", "uv", "uvx.exe", "uv.exe"):
+                        hint = (" Install uv (winget install astral-sh.uv, or"
+                                " https://docs.astral.sh/uv/getting-started/installation/),"
+                                " then restart the bridge.")
                     self.start_error = (
                         f"command not found: '{cmd[0]}' - is it installed and on PATH? "
-                        f"(configured for server '{self.id}' in config.json)"
+                        f"(configured for server '{self.id}' in config.json){hint}"
                     )
                     log(f"[{self.id}] {self.start_error}", "rd")
                     raise
-                except OSError as e:
-                    self.start_error = f"could not launch '{cmd[0]}': {e}"
-                    log(f"[{self.id}] {self.start_error}", "rd")
-                    raise
-                else:
-                    self.start_error = None
-                with self.pend_lock:
-                    self.pending.clear()
-                self.saw_foreign_ws_host = False  # fresh process, fresh verdict
-                self._reader_thread = threading.Thread(target=self._reader, args=(self.proc,), daemon=True)
-                self._reader_thread.start()
-                threading.Thread(target=self._stderr_drain, args=(self.proc,), daemon=True).start()
+            except OSError as e:
+                self.start_error = f"could not launch '{cmd[0]}': {e}"
+                log(f"[{self.id}] {self.start_error}", "rd")
+                raise
+            else:
+                self.start_error = None
+            with self.pend_lock:
+                self.pending.clear()
+            self.saw_foreign_ws_host = False  # fresh process, fresh verdict
+            self._reader_thread = threading.Thread(target=self._reader, args=(self.proc,), daemon=True)
+            self._reader_thread.start()
+            threading.Thread(target=self._stderr_drain, args=(self.proc,), daemon=True).start()
 
-                # MCP handshake.
-                self._request("initialize", {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "zeroscript-bridge", "version": "1.0"},
-                }, timeout=30)
-                self._notify("notifications/initialized")
-                # Some MCP servers (notably Roblox's StudioMCP) advertise 0 tools at
-                # the instant initialize returns, because they connect to their
-                # backend (the running Studio) a moment AFTER the stdio handshake.
-                # A single tools/list then caches an empty list forever. So if we
-                # get nothing, retry for a few seconds to let the backend attach.
-                # Short per-attempt timeout so the bridge never looks frozen if the
-                # server stays silent (e.g. Studio not open yet); ~12s total budget.
-                for _ in range(12):
-                    if self.refresh_tools(timeout=3):
-                        break
-                    if not self.is_alive():
-                        break
-                    time.sleep(1.0)
-            log(f"[{self.id}] MCP server up  ({len(self.tools_cache)} tools advertised)", "cy")
+            # MCP handshake.
+            self._request("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "zeroscript-bridge", "version": "1.0"},
+            }, timeout=30)
+            self._notify("notifications/initialized")
+            # Some MCP servers (notably Roblox's StudioMCP) advertise 0 tools at
+            # the instant initialize returns, because they connect to their
+            # backend (the running Studio) a moment AFTER the stdio handshake.
+            # A single tools/list then caches an empty list forever. So if we
+            # get nothing, retry for a few seconds to let the backend attach.
+            # Short per-attempt timeout so the bridge never looks frozen if the
+            # server stays silent (e.g. Studio not open yet); ~12s total budget.
+            for _ in range(12):
+                if self.refresh_tools(timeout=3):
+                    break
+                if not self.is_alive():
+                    break
+                time.sleep(1.0)
+            # A server that DIED during the handshake is a "failed" start, not
+            # a quiet one: name the reason (exit code + first stderr line) so
+            # the extension's failed state and the crash-loop banner carry the
+            # actual cause. No control-flow change - this only fills
+            # start_error, which health() reports and server_watch prints.
+            if not self.is_alive() and not self.tools_cache and self.start_error is None:
+                first_err = f": {self.stderr_tail[0]}" if self.stderr_tail else ""
+                self.start_error = (f"server exited during startup "
+                                    f"(exit code {self.last_exit}){first_err}")
+        log(f"[{self.id}] MCP server up  ({len(self.tools_cache)} tools advertised)", "cy")
 
     def is_alive(self):
         return self.proc is not None and self.proc.poll() is None
+
+    @staticmethod
+    def _resolve_uvx():
+        """Find uvx/uv in the standard per-user install locations, for launches
+        whose PATH is minimal (GUI-started bridge). Returns an absolute path or
+        None. Addon-only path: the Roblox command is a local .py file and never
+        enters this branch (its FileNotFoundError keeps the plain message)."""
+        exe_names = ("uvx.exe", "uvx", "uv.exe", "uv") if sys.platform == "win32" else ("uvx", "uv")
+        roots = []
+        if sys.platform == "win32":
+            roots += [os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
+                      os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links"),
+                      os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "uv")]
+        else:
+            roots += [os.path.expanduser("~/.local/bin"), "/usr/local/bin",
+                      "/opt/homebrew/bin", "/usr/bin"]
+        for root in roots:
+            if not root:
+                continue
+            for name in exe_names:
+                cand = os.path.join(root, name)
+                if os.path.isfile(cand):
+                    return cand
+        return None
+
 
     def restart(self):
         log(f"[{self.id}] restarting...", "yl")
@@ -1066,13 +1408,22 @@ class MCPManager:
         self.clients = {}          # server_id -> MCPClient
         self.index = {}            # advertised_name -> (holder, real_name)
         self.index_lock = threading.Lock()
+        # clients is mutated from the event-loop thread (load_config at boot)
+        # AND from worker threads (asyncio.to_thread(add_server_live /
+        # remove_server_live), server_watch's to_thread(client.start) reads it).
+        # Iteration and mutation from different threads is a real race even
+        # under the GIL ("RuntimeError: dictionary changed size during
+        # iteration"); every access below takes this lock.
+        self.clients_lock = threading.RLock()
 
     def load_config(self):
         servers = _read_config().get("mcpServers", {}) or {}
-        for sid, spec in servers.items():
-            self.clients[sid] = MCPClient(
-                sid, spec.get("command"), spec.get("args"), spec.get("env"))
-        log(f"configured {len(self.clients)} MCP server(s): {', '.join(self.clients) or '(none)'}", "cy")
+        with self.clients_lock:
+            for sid, spec in servers.items():
+                self.clients[sid] = MCPClient(
+                    sid, spec.get("command"), spec.get("args"), spec.get("env"))
+            configured = dict(self.clients)
+        log(f"configured {len(configured)} MCP server(s): {', '.join(configured) or '(none)'}", "cy")
 
     def start_all(self):
         # Launch every configured server IN PARALLEL, not one after another.
@@ -1085,7 +1436,9 @@ class MCPManager:
         # dependency entirely: a slow/absent Roblox Studio no longer holds up
         # an addon server the user actually wants right now.
         threads = []
-        for sid, client in self.clients.items():
+        with self.clients_lock:
+            snapshot = list(self.clients.items())
+        for sid, client in snapshot:
             def _run(sid=sid, client=client):
                 try:
                     client.start()
@@ -1122,7 +1475,9 @@ class MCPManager:
                     log(f"[{sid}] refresh failed: {e}", "yl")
             self.rebuild_index()
         out = []
-        for sid, client in self.clients.items():
+        with self.clients_lock:
+            snapshot = list(self.clients.items())
+        for sid, client in snapshot:
             for t in (client.tools_cache or []):
                 name = t.get("name")
                 advertised = name
@@ -1152,7 +1507,10 @@ class MCPManager:
         return holder.call_tool(real_name, arguments, timeout)
 
     def restart(self, server_id=None):
-        targets = [self.clients[server_id]] if server_id and server_id in self.clients else list(self.clients.values())
+        with self.clients_lock:
+            targets = ([self.clients[server_id]]
+                       if server_id and server_id in self.clients
+                       else list(self.clients.values()))
         for client in targets:
             try:
                 client.restart()
@@ -1161,11 +1519,70 @@ class MCPManager:
         self.rebuild_index()
 
     def health(self):
-        return [{"id": sid, "alive": c.is_alive(), "tools": len(c.tools_cache)}
-                for sid, c in self.clients.items()]
+        # "error" surfaces the addon's start failure (e.g. 'uvx' not installed)
+        # to the extension UI and to the model's list_mcp_servers output, so a
+        # dead addon shows WHY it is dead instead of a bare "offline" dot. The
+        # primary Roblox server almost never has one (its start errors are
+        # diagnosed in the terminal), and None renders as nothing anywhere.
+        with self.clients_lock:
+            snapshot = list(self.clients.items())
+        return [{"id": sid, "alive": c.is_alive(), "tools": len(c.tools_cache),
+                 "starting": c.starting, "error": c.start_error}
+                for sid, c in snapshot]
 
     def any_alive(self):
-        return any(c.is_alive() for c in self.clients.values())
+        with self.clients_lock:
+            return any(c.is_alive() for c in self.clients.values())
+
+    # ── live addon add/remove (no bridge restart) ──────────────────────────
+    # Adding/removing an addon server used to rewrite config.json and then
+    # execv() the whole bridge. That worked, but it dropped every socket - any
+    # in-flight Roblox tool call died with it, the extension had to show a
+    # spinner through a full reconnect, and the restart fought with the
+    # port-reclaim logic on machines where relaunching is slow. Since only
+    # ADDON servers are ever added/removed (the primary roblox server is
+    # protected in config_add/remove_server), the manager can do it live: stop
+    # or start just that client, rebuild the tool index, and broadcast. The
+    # Roblox proxy keeps running untouched throughout.
+
+    def add_server_live(self, spec):
+        """Register + return (not yet started) the MCPClient for a validated
+        addon spec, replacing any live client with the same id. The caller
+        starts it on a worker thread (start() blocks for up to ~45s on the
+        handshake/grace loop) and broadcasts once it settles."""
+        sid = spec["server_id"]
+        with self.clients_lock:
+            old = self.clients.get(sid)
+            if old is not None and sid != PRIMARY_SERVER_ID:
+                old.stop()
+            client = MCPClient(sid, spec["command"], spec["args"], spec.get("env"))
+            client.starting = True  # start() flips it; health shows Connecting now
+            # Register BEFORE starting, so server_watch already owns the crash-loop
+            # handling if start() fails (same lifecycle as a config-loaded server).
+            self.clients[sid] = client
+        return client
+
+    def remove_server_live(self, server_id):
+        """Stop and forget a live addon server. Refuses the primary server.
+        Returns True if a live client was removed."""
+        if server_id == PRIMARY_SERVER_ID:
+            return False
+        with self.clients_lock:
+            client = self.clients.pop(server_id, None)
+        if client is None:
+            return False
+        try:
+            client.stop()
+        except Exception:
+            pass
+        self.rebuild_index()
+        return True
+
+    def client(self, server_id):
+        """Snapshot lookup of one client under the clients lock (readers run on
+        the event loop while add/remove run on worker threads)."""
+        with self.clients_lock:
+            return self.clients.get(server_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1173,6 +1590,162 @@ class MCPManager:
 # ══════════════════════════════════════════════════════════════════════════
 mgr = MCPManager()
 clients = set()
+
+# ── HTTP-handshake gate + token endpoints ──────────────────────────────────
+# Feature-detect the websockets API style: modern (>=13, asyncio impl) hands
+# process_request an async (connection, request) and returns a Response; legacy
+# hands (path, request_headers) and returns a (status, headers, body) tuple or
+# None. Both can reject a handshake BEFORE the connection upgrades, which is
+# what the Origin/Host/limit checks need.
+try:
+    from websockets.asyncio.server import Response as _WSResponse
+    from websockets.datastructures import Headers as _WSHeaders
+    _WS_MODERN = True
+except Exception:
+    _WS_MODERN = False
+
+MAX_CLIENTS = 8                 # concurrent authenticated connections
+RATE_WINDOW_S = 10.0            # per-connection message rate limit window
+RATE_MAX_MSGS = 60              # ...and the cap inside it (pings included)
+CALL_CACHE_SIZE = 128           # completed call_id results kept for replay
+CALL_CACHE_TTL_S = 120.0        # ...for this long (idempotent reconnect replay)
+
+# HTTP endpoints served on the same port, Origin-gated so a WEB PAGE can never
+# read them (the browser refuses to let a page claim an extension origin; the
+# MV3 service worker's host_permissions for http://127.0.0.1/* let it bypass
+# CORS and read the body). Local processes could spoof these headers - see the
+# honest-scope note in the AUTH section above; they are here to keep the token
+# out of reach of pages, not out of reach of the machine's own user.
+AUTH_TOKEN_PATH = "/zs-auth-token"
+AUTH_ROTATE_PATH = "/zs-auth/rotate"
+
+
+def _ext_origin(headers):
+    """The Origin header if it matches the extension allowlist, else None.
+    Absent -> None (callers decide what absence means for them)."""
+    try:
+        origin = headers.get("Origin")
+    except Exception:
+        return None
+    if origin and EXT_ORIGIN_RE.fullmatch(origin):
+        return origin
+    return None
+
+
+def _valid_host(headers):
+    """True when the Host header names THIS loopback listener. A DNS-rebinding
+    page resolves its domain to 127.0.0.1 but arrives with Host: attacker.com -
+    rejected here before the connection upgrades."""
+    try:
+        host = headers.get("Host")
+    except Exception:
+        return False
+    if not host:
+        return False
+    host = host.lower()
+    return host in (f"127.0.0.1:{PORT}", f"localhost:{PORT}", f"[::1]:{PORT}")
+
+
+def _gate_request(path, headers, want_body):
+    """Shared decision logic for both websockets API styles. Returns
+    (status_code, body_bytes) to reject, or None to let the handshake proceed.
+    want_body=True marks the token endpoints, which demand a strict
+    extension origin; the WS upgrade accepts a MISSING origin (non-browser
+    clients - they still need the token) but rejects any present, non-extension
+    origin (i.e. every web page)."""
+    if not _valid_host(headers):
+        return (403, b"rejected: bad Host")
+    origin = _ext_origin(headers)
+    if want_body:
+        # token delivery: extension contexts ONLY, never a bare/absent origin
+        if not origin:
+            return (403, b"rejected: extension origin required")
+    else:
+        # ws upgrade: any PRESENT origin must be an extension context
+        try:
+            raw_origin = headers.get("Origin")
+        except Exception:
+            raw_origin = None
+        if raw_origin and not origin:
+            return (403, b"rejected: origin not allowed")
+    return None
+
+
+def _make_process_request():
+    if _WS_MODERN:
+        async def process_request(connection, request):
+            path = getattr(request, "path", "") or ""
+            headers = request.headers
+            if path == AUTH_TOKEN_PATH:
+                bad = _gate_request(path, headers, want_body=True)
+                if bad:
+                    return _WSResponse(bad[0], "Forbidden", _WSHeaders(
+                        [("Content-Type", "text/plain"),
+                         ("Cache-Control", "no-store")]), bad[1])
+                body = json.dumps({"token": bridge_auth_token}).encode()
+                return _WSResponse(200, "OK", _WSHeaders(
+                    [("Content-Type", "application/json"),
+                     ("Cache-Control", "no-store")]), body)
+            if path == AUTH_ROTATE_PATH:
+                bad = _gate_request(path, headers, want_body=True)
+                if bad:
+                    return _WSResponse(bad[0], "Forbidden", _WSHeaders(
+                        [("Content-Type", "text/plain"),
+                         ("Cache-Control", "no-store")]), bad[1])
+                new_token = _auth_rotate()
+                # Kill every authed connection so the OLD token is dead at once;
+                # extensions re-fetch the token and reconnect automatically.
+                for ws in list(authed_conns):
+                    try:
+                        asyncio.ensure_future(ws.close(code=4002, reason="token rotated"))
+                    except Exception:
+                        pass
+                body = json.dumps({"token": new_token}).encode()
+                return _WSResponse(200, "OK", _WSHeaders(
+                    [("Content-Type", "application/json"),
+                     ("Cache-Control", "no-store")]), body)
+            bad = _gate_request(path, headers, want_body=False)
+            if bad:
+                return _WSResponse(bad[0], "Forbidden", _WSHeaders(
+                    [("Content-Type", "text/plain")]), bad[1])
+            return None
+
+        return process_request
+
+    # Legacy API (older websockets): sync (path, request_headers) -> tuple|None
+    def process_request(path, request_headers):
+        if path == AUTH_TOKEN_PATH:
+            bad = _gate_request(path, request_headers, want_body=True)
+            if bad:
+                return (bad[0], _WSHeaders([("Content-Type", "text/plain"),
+                                            ("Cache-Control", "no-store")]), bad[1])
+            return (200, _WSHeaders([("Content-Type", "application/json"),
+                                     ("Cache-Control", "no-store")]),
+                    json.dumps({"token": bridge_auth_token}).encode())
+        if path == AUTH_ROTATE_PATH:
+            bad = _gate_request(path, request_headers, want_body=True)
+            if bad:
+                return (bad[0], _WSHeaders([("Content-Type", "text/plain"),
+                                            ("Cache-Control", "no-store")]), bad[1])
+            new_token = _auth_rotate()
+            for ws in list(authed_conns):
+                try:
+                    asyncio.ensure_future(ws.close(code=4002, reason="token rotated"))
+                except Exception:
+                    pass
+            return (200, _WSHeaders([("Content-Type", "application/json"),
+                                     ("Cache-Control", "no-store")]),
+                    json.dumps({"token": new_token}).encode())
+        bad = _gate_request(path, request_headers, want_body=False)
+        if bad:
+            return (bad[0], _WSHeaders([("Content-Type", "text/plain")]), bad[1])
+        return None
+
+    return process_request
+
+
+bridge_auth_token = None  # set in main() before the server starts listening
+
 
 # ── Studio connectivity probe ──────────────────────────────────────────────
 # The MCP server process stays alive even when Roblox Studio is closed or its
@@ -1230,7 +1803,7 @@ def probe_studio():
       place - a place/datamodel is actually loaded and usable. False = Studio open on
               the home screen, or the active place was closed. Only meaningful when
               app is True (when app is False/None, place mirrors it)."""
-    roblox = mgr.clients.get(PRIMARY_SERVER_ID)
+    roblox = mgr.client(PRIMARY_SERVER_ID)
     if roblox is not None and roblox.is_alive() and not roblox.tools_cache:
         # StudioMCP advertises ZERO tools - including list_roblox_studios itself -
         # until Studio actually attaches. That makes _probe_tool_text() below
@@ -1273,7 +1846,7 @@ def safe_call(name, arguments, timeout):
         return {"ok": False, "error": str(e), "kind": type(e).__name__}
 
 
-async def run_tool_task(ws, name, args, timeout, rid):
+async def run_tool_task(ws, name, args, timeout, rid, call_id=None):
     """Execute one tool off the socket read loop and send its result back.
 
     Kept as a standalone task (not awaited inline in handler) so a long tool
@@ -1289,10 +1862,28 @@ async def run_tool_task(ws, name, args, timeout, rid):
     # the console; they still land in bridge_debug.log. A failed/slow call
     # DOES surface on the terminal - that's the signal a user should notice.
     log(f"<- {name} ({elapsed:.1f}s){slow}: {summary}", tag, terminal=not res.get("ok") or elapsed > 5)
+    # Idempotency bookkeeping: hand the result to any coalesced duplicate
+    # caller and remember it briefly, so a replayed call_id after a reconnect
+    # gets the SAME result instead of re-executing the tool (an execute_* call
+    # running twice is exactly the failure this prevents).
+    if call_id:
+        fut = _inflight_calls.pop(call_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(res)
+        _call_cache[call_id] = (res, time.monotonic())
+        while len(_call_cache) > CALL_CACHE_SIZE:
+            _call_cache.pop(next(iter(_call_cache)))
     try:
         await ws.send(json.dumps({"type": "tool_result", "id": rid, **res}))
     except websockets.ConnectionClosed:
         pass
+
+
+# Event-loop-confined (all access is inside handler/run_tool_task on the
+# asyncio thread): call_id -> future for calls CURRENTLY executing, and
+# call_id -> (result, finished_at) for calls that finished recently.
+_inflight_calls = {}
+_call_cache = {}
 
 
 async def broadcast_status():
@@ -1338,11 +1929,98 @@ async def broadcast_status():
             pass
 
 
+def _start_client_background(client, loop):
+    """Start an addon MCP client on a daemon thread; broadcast status when it
+    settles (alive with tools, or failed with start_error named).
+
+    Used by the add_server handler: client.start() blocks for up to ~45s
+    (initialize handshake + the tools grace loop), and on the very FIRST launch
+    of a uvx/npx-based server (e.g. `uvx mcp-for-blender`) uv may additionally
+    spend 30-60s downloading the package. Running that in the handler would
+    freeze the socket loop; instead we ack immediately and let these
+    broadcasts carry the "it's up" moment to every connected extension.
+    """
+    def _run():
+        replaced = False
+        try:
+            client.start()
+        except Exception as e:
+            log(f"[{client.id}] failed to start: {e}  (auto-restart continues)", "rd")
+        finally:
+            # If the user removed or replaced this server while the start was
+            # still running, stop here: we would otherwise leave a freshly
+            # spawned child process alive with nothing owning it.
+            try:
+                current = mgr.clients.get(client.id)
+            except Exception:
+                current = client
+            if current is not client:
+                replaced = True
+                try:
+                    client.stop()
+                except Exception:
+                    pass
+            try:
+                asyncio.run_coroutine_threadsafe(broadcast_status(), loop)
+            except Exception:
+                pass
+        if client.is_alive():
+            log(f"[{client.id}] addon server ready ({len(client.tools_cache)} tools)"
+                + ("  (was removed during start - stopping)" if replaced else ""), "gr")
+
+    threading.Thread(target=_run, daemon=True, name=f"zs-add-{client.id}").start()
+
+
 async def handler(ws):
     peer = getattr(ws, "remote_address", ("?",))[0]
-    clients.add(ws)
-    log(f"extension connected  ({peer})  [{len(clients)} client(s)]", "gr")
+    # ── AUTHENTICATION GATE ────────────────────────────────────────────────
+    # The FIRST message must be {"type":"hello","token":<token>} within the
+    # timeout. Anything else - or a timeout - closes the socket with a
+    # dedicated code and NO request is processed, not even an error reply that
+    # could leak state. The gate closes the web-page and foreign-local-client
+    # attack: without the per-install token nothing below is reachable.
     try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=HELLO_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log(f"rejected connection ({peer}): no hello within {HELLO_TIMEOUT_S}s", "yl")
+        try:
+            await ws.close(code=4000, reason="auth timeout")
+        except Exception:
+            pass
+        return
+    except websockets.ConnectionClosed:
+        return
+    except Exception as e:
+        log(f"auth failed ({peer}): {e}", "yl")
+        return
+    hello = None
+    try:
+        hello = json.loads(raw)
+    except Exception:
+        pass
+    if not isinstance(hello, dict) or hello.get("type") != "hello" \
+            or not _ct_equal(str(hello.get("token", "")), bridge_auth_token):
+        log(f"rejected connection ({peer}): bad or missing token", "yl")
+        try:
+            await ws.close(code=4003, reason="invalid token")
+        except Exception:
+            pass
+        return
+    if len(clients) >= MAX_CLIENTS:
+        log(f"rejected connection ({peer}): too many connections ({len(clients)})", "yl")
+        try:
+            await ws.close(code=4007, reason="too many connections")
+        except Exception:
+            pass
+        return
+    clients.add(ws)
+    authed_conns.add(ws)
+    log(f"extension connected  ({peer})  [{len(clients)} client(s)]", "gr")
+    rate_times = []  # timestamps of recent frames, for the rate limit below
+    try:
+        # hello_ok FIRST: the extension treats the auth handshake as complete
+        # only when it sees this frame (it then expects the connected snapshot).
+        await ws.send(json.dumps({"type": "hello_ok", "bridge_version": BRIDGE_VERSION}))
         _st = await asyncio.to_thread(probe_studio)
         await ws.send(json.dumps({
             "type": "connected",
@@ -1354,9 +2032,29 @@ async def handler(ws):
             "port": PORT,
         }))
         async for raw in ws:
+            # ── per-connection rate limit (pings included) ─────────────────
+            now = time.monotonic()
+            rate_times.append(now)
+            while rate_times and now - rate_times[0] > RATE_WINDOW_S:
+                rate_times.pop(0)
+            if len(rate_times) > RATE_MAX_MSGS:
+                log(f"rate limited ({peer}): >{RATE_MAX_MSGS} msgs in {RATE_WINDOW_S}s - closing", "yl")
+                try:
+                    await ws.close(code=4008, reason="rate limited")
+                except Exception:
+                    pass
+                break
             try:
                 msg = json.loads(raw)
             except Exception:
+                # Malformed payload: answer with an error so the rejection is
+                # observable, and touch nothing else.
+                await ws.send(json.dumps({"type": "error", "id": None,
+                                          "error": "malformed payload: not JSON"}))
+                continue
+            if not isinstance(msg, dict):
+                await ws.send(json.dumps({"type": "error", "id": None,
+                                          "error": "malformed payload: not an object"}))
                 continue
             mtype = msg.get("type")
             rid = msg.get("id")
@@ -1392,7 +2090,44 @@ async def handler(ws):
                 name = msg.get("name", "")
                 args = msg.get("arguments") or {}
                 timeout = float(msg.get("timeout", 120000)) / 1000.0
+                call_id = msg.get("call_id")
                 log(f"-> tool  {name}({', '.join(args.keys())})", "cy", terminal=False)
+                # IDEMPOTENCY (call_id): the extension stamps every logical
+                # tool call with a stable id. Three guards, in order:
+                #   1. finished recently -> replay the SAME result, no execute
+                #      ("cached"); covers a reconnect landing after completion.
+                #   2. currently executing -> coalesce onto the in-flight call
+                #      ("coalesced"); covers a reconnect DURING execution - the
+                #      tool runs exactly once and both connections get it.
+                #   3. otherwise -> start it and register the future.
+                # The old extension omits call_id -> straight through, byte-
+                # identical legacy behaviour (Roblox path untouched).
+                if call_id:
+                    cached = _call_cache.get(call_id)
+                    if cached and time.monotonic() - cached[1] <= CALL_CACHE_TTL_S:
+                        log(f"<- {name}: replayed cached result (call_id {call_id})", "cy", terminal=False)
+                        try:
+                            await ws.send(json.dumps({"type": "tool_result", "id": rid,
+                                                      "cached": True, **cached[0]}))
+                        except websockets.ConnectionClosed:
+                            pass
+                        continue
+                    fut = _inflight_calls.get(call_id)
+                    if fut is not None:
+                        log(f"-> tool  {name}: duplicate call_id {call_id} - coalescing", "cy", terminal=False)
+                        try:
+                            res = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout + 15)
+                        except Exception as e:
+                            res = {"ok": False, "error": f"coalesced call failed: {e}", "kind": "CoalesceError"}
+                        try:
+                            await ws.send(json.dumps({"type": "tool_result", "id": rid,
+                                                      "coalesced": True, **res}))
+                        except websockets.ConnectionClosed:
+                            pass
+                        continue
+                    _inflight_calls[call_id] = asyncio.get_running_loop().create_future()
+                    while len(_inflight_calls) > CALL_CACHE_SIZE:
+                        _inflight_calls.pop(next(iter(_inflight_calls)))
                 # Run the tool as a BACKGROUND task instead of awaiting it here.
                 # Awaiting inline parks this read loop for the WHOLE tool call, so
                 # a long tool (e.g. wait_job_finished > 25s) means the client's
@@ -1403,31 +2138,61 @@ async def handler(ws):
                 # The extension only ever has ONE call_tool in flight (its agent
                 # loop awaits each result before sending the next), so this never
                 # overlaps tool executions.
-                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid))
+                asyncio.create_task(run_tool_task(ws, name, args, timeout, rid, call_id))
 
             elif mtype in ("add_server", "remove_server"):
-                # Adding/removing an addon MCP server rewrites config.json, which
-                # the bridge only reads at launch - so we ack, then restart the
-                # whole process to pick it up cleanly. The primary Roblox server
-                # is protected inside config_add/remove_server.
+                # Add/remove an ADDON MCP server live: validate, persist to
+                # config.json (so the next boot keeps it), then start/stop just
+                # that client in the running manager. No bridge restart - the
+                # socket, the Roblox proxy and any in-flight tool call all stay
+                # untouched (the old execv restart dropped all three). The
+                # primary Roblox server is protected inside
+                # config_add/remove_server AND validate_server_spec AND
+                # MCPManager.remove_server_live - three independent guards, so
+                # no single bad message can ever touch it.
+                warning = None
                 if mtype == "add_server":
-                    ok, err = await asyncio.to_thread(
-                        config_add_server,
+                    spec, err = validate_server_spec(
                         msg.get("server_id"), msg.get("command"),
                         msg.get("args"), msg.get("env"))
+                    if spec is None:
+                        ok = False
+                        err = err or "invalid server spec"
+                    else:
+                        ok, err = await asyncio.to_thread(
+                            config_add_server, spec["server_id"],
+                            spec["command"], spec["args"], spec["env"])
+                        if ok:
+                            # Off-loop: replacing an existing live server runs
+                            # client.stop(), which on Windows can taskkill for up
+                            # to 8s - that must never sit on the socket loop.
+                            client = await asyncio.to_thread(mgr.add_server_live, spec)
+                            _start_client_background(client, asyncio.get_running_loop())
+                            # Event-driven status: ONE broadcast right now (so
+                            # the extension sees the server in health with
+                            # starting:true), and _start_client_background
+                            # broadcasts again the moment the start settles
+                            # (ready or failed) - no fixed-delay timers.
                 else:
-                    ok, err = await asyncio.to_thread(
-                        config_remove_server, msg.get("server_id"))
+                    sid = msg.get("server_id")
+                    ok, err = await asyncio.to_thread(config_remove_server, sid)
+                    if ok:
+                        # Off-loop for the same reason as add: stop() may
+                        # taskkill a whole process tree (up to 8s on Windows).
+                        if await asyncio.to_thread(mgr.remove_server_live, sid):
+                            log(f"[{sid}] addon server removed (live)", "cy")
+                        else:
+                            # In config but not live (e.g. failed to start at boot,
+                            # or a stale entry) - still fine: config is cleaned.
+                            warning = f"server '{sid}' was in config.json but was not running"
                 await ws.send(json.dumps({
                     "type": "server_changed", "id": rid,
-                    "ok": ok, "error": err, "restarting": ok,
+                    "ok": ok, "error": err,
+                    "warning": warning,
+                    "restarting": False,  # live add/remove - the socket stays up
                 }))
                 if ok:
-                    # Give the ack a beat to flush over the socket, then restart.
-                    async def _do_restart():
-                        await asyncio.sleep(0.4)
-                        restart_self()
-                    asyncio.create_task(_do_restart())
+                    await broadcast_status()
 
             elif mtype == "restart_mcp":
                 sid = msg.get("server")
@@ -1453,6 +2218,7 @@ async def handler(ws):
         log(f"handler error: {e}", "rd")
     finally:
         clients.discard(ws)
+        authed_conns.discard(ws)
         log(f"extension disconnected  [{len(clients)} client(s)]", "yl")
 
 
@@ -1475,7 +2241,9 @@ async def server_watch():
     LOOP_WARN_COOLDOWN = 120
     while True:
         await asyncio.sleep(5)
-        for sid, client in list(mgr.clients.items()):
+        with mgr.clients_lock:
+            watch_list = list(mgr.clients.items())
+        for sid, client in watch_list:
             try:
                 if not client.is_alive():
                     now = time.time()
@@ -1587,7 +2355,7 @@ async def studio_watch(initial_app, initial_place=None):
         # every poll while the catalogue is empty; the moment Studio attaches,
         # tools appear, the index rebuilds, and the normal probe below flips
         # the state to connected on this same iteration.
-        rc0 = mgr.clients.get("roblox")
+        rc0 = mgr.client("roblox")
         if rc0 is not None and rc0.is_alive() and not rc0.tools_cache:
             got = False
             try:
@@ -1792,8 +2560,13 @@ async def _supervised(name, coro_factory):
 
 
 async def main():
+    global bridge_auth_token
     print(f"\n{C['cy']}  ZeroScript Bridge v{BRIDGE_VERSION}{C['reset']}  {C['dim']}- Roblox Studio - ws://{HOST}:{PORT}{C['reset']}\n")
     log(f"===== BRIDGE START  v{BRIDGE_VERSION}  pid={os.getpid()}  log={LOG_PATH} =====", "cy")
+    # Auth token must exist BEFORE the socket starts listening: the token
+    # endpoint and the hello gate both read it. (Also warms the file so a
+    # support report can include the fingerprint without touching secrets.)
+    bridge_auth_token = await asyncio.to_thread(_auth_load_or_create)
     await asyncio.to_thread(_kill_orphan_studio_mcp)
     killed_squatter = await asyncio.to_thread(check_studio_port)
     mgr.load_config()
@@ -1866,7 +2639,7 @@ async def main():
         # every configured server (Roblox + addons like Blender), so printing
         # `total` there falsely blamed addon tools on "NO Roblox Studio connected"
         # (seen live: 49 = 27 Roblox + 22 Blender, message only about Roblox).
-        roblox_client = mgr.clients.get("roblox")
+        roblox_client = mgr.client("roblox")
         roblox_total = len(roblox_client.tools_cache) if roblox_client else 0
 
         # Port-hijack check (ropilot etc.), done at boot: the child's stderr has
@@ -2005,7 +2778,19 @@ async def main():
     try:
         server_ctx = await websockets.serve(
             handler, HOST, PORT, ping_interval=20, ping_timeout=20,
-            max_size=16 * 1024 * 1024)
+            max_size=16 * 1024 * 1024,
+            process_request=_make_process_request())
+    except TypeError:
+        # Very old websockets without process_request support at all: the
+        # handshake gate (Origin/Host) and the token endpoints are part of the
+        # security model - refuse to run silently weakened; tell the user the
+        # exact fix instead.
+        log("security gate unavailable: this websockets version has no"
+            " process_request support.", "rd")
+        log(f"    Fix: {sys.executable} -m pip install -U websockets  (then start the bridge again)", "yl")
+        log("    Refusing to listen without it - running unauthenticated would expose"
+            " add_server (process execution) to any local web page.", "rd")
+        return
     except OSError as e:
         # errno 10048 (Win) / EADDRINUSE: something we could NOT auto-kill still
         # owns the port - another app, or a python whose cmdline we couldn't read.
@@ -2023,6 +2808,8 @@ async def main():
 
     async with server_ctx:
         log(f"listening on ws://{HOST}:{PORT}  - load the extension and open a supported AI chat", "cy")
+        log(f"auth: token active (fingerprint {bridge_auth_token[:8]}... in {AUTH_FILE}) -"
+            " the extension pairs with it automatically", "cy")
         asyncio.create_task(_supervised("server_watch", server_watch))
         asyncio.create_task(_boot_and_diagnose())
         asyncio.create_task(_early_studio_guidance())

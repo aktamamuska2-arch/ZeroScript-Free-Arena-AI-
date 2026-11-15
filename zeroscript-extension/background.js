@@ -8,7 +8,15 @@
 // even when the bridge is offline. The agentic loop must never hang waiting.
 
 const PORT = 17613;
-const URL = `ws://127.0.0.1:${PORT}`;
+// BRIDGE_URL (not `URL`): a top-level `const URL` SHADOWS the global URL
+// constructor for this whole worker - any later `new URL(...)` here would
+// explode confusingly. Named for what it is instead.
+const BRIDGE_URL = `ws://127.0.0.1:${PORT}`;
+// Token endpoint on the bridge (same port). The bridge serves the per-install
+// token ONLY to extension origins (Origin-gated, no CORS headers), so a web
+// page can neither connect nor read the token; the service worker can, via the
+// manifest's host_permissions for http://127.0.0.1/*.
+const AUTH_URL = `http://127.0.0.1:${PORT}/zs-auth-token`;
 
 // Chat sites where a ZeroScript provider content script runs. Status pushes go
 // to every tab matching these. Add the new provider's URL pattern here (and in
@@ -26,6 +34,13 @@ const REQUEST_TIMEOUT_DEFAULT = 130000; // a bit above the 120s tool timeout
 
 let ws = null;
 let connected = false;
+// Bridge auth state: pending (handshake running) | ok (token accepted) |
+// legacy (old bridge without auth - still allowed) | failed (bridge refused
+// the token and re-fetching one did not help). Surfaced in statusObj so the
+// UI and diagnostics can tell these apart.
+let authState = "pending";
+let authToken = null; // in-memory only; re-fetched from the bridge on demand
+let helloTimer = null;
 let reconnectDelay = RECONNECT_MIN;
 let reconnectTimer = null;
 let heartbeatTimer = null;
@@ -71,12 +86,12 @@ function connect() {
   }
 
   ws.onopen = () => {
-    connected = true;
     reconnectDelay = RECONNECT_MIN;
     lastMessageAt = Date.now();
-    log("connected to bridge");
-    startHeartbeat();
-    broadcastStatus();
+    // NOT marking `connected` yet: the hello handshake must pass (or an old
+    // bridge must reveal itself) before anything else is sent. send() waits
+    // for `connected`, so no request can race the auth gate.
+    doHello();
   };
 
   ws.onmessage = (ev) => {
@@ -92,11 +107,13 @@ function connect() {
 
   ws.onclose = () => {
     connected = false;
+    authState = "pending"; // re-arm the handshake for the next attempt
     mcpAlive = false;
     studioConnected = null;
     studioApp = null;
     studioProc = null;
     serversCache = [];
+    clearTimeout(helloTimer);
     stopHeartbeat();
     failAllPending("bridge connection closed");
     broadcastStatus();
@@ -107,6 +124,50 @@ function connect() {
     // onclose will follow; nothing to do here but avoid an unhandled error.
     try { ws.close(); } catch {}
   };
+}
+
+// ── hello handshake (bridge authentication) ───────────────────────────────
+// Every connection sends {"type":"hello","token":...} as its FIRST message.
+//  - New bridge accepts it -> "hello_ok" -> then the usual "connected" snapshot.
+//  - New bridge rejects it -> close 4003 -> we re-fetch the token once (the
+//    bridge may have rotated it) and reconnect.
+//  - OLD bridge (pre-auth) replies to the unknown message type with an error
+//    AND has already sent its "connected" snapshot first - either frame marks
+//    the peer legacy and the session continues unauthenticated, exactly as it
+//    did before this handshake existed.
+async function fetchToken(timeoutMs = 4000) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const r = await fetch(AUTH_URL, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    const d = await r.json().catch(() => null);
+    return d && typeof d.token === "string" && d.token ? d.token : null;
+  } catch (e) {
+    return null; // bridge down, or an old bridge without the endpoint
+  }
+}
+
+async function doHello() {
+  clearTimeout(helloTimer);
+  helloTimer = setTimeout(() => {
+    log("hello handshake timed out - dropping the socket");
+    try { ws.close(); } catch {}
+  }, 8000);
+  if (authToken === null) authToken = await fetchToken();
+  if (authToken === null) {
+    // No endpoint answered: could be an old bridge (its "connected" frame will
+    // still arrive) or a dead bridge (onclose fires). Send an empty-token
+    // hello so BOTH cases resolve deterministically within the timeout.
+    authToken = "";
+  }
+  try {
+    ws.send(JSON.stringify({ type: "hello", token: authToken }));
+  } catch (e) {
+    log("hello send failed", e);
+    try { ws.close(); } catch {}
+  }
 }
 
 function scheduleReconnect() {
@@ -208,6 +269,52 @@ async function refreshStudioStatus() {
 }
 
 function handleBridgeMessage(msg) {
+  // ── auth handshake frames (before everything else) ──
+  if (msg.type === "hello_ok") {
+    clearTimeout(helloTimer);
+    authState = "ok";
+    connected = true;
+    lastMessageAt = Date.now();
+    log("bridge auth ok");
+    startHeartbeat();
+    broadcastStatus(); // the "connected" snapshot follows right after
+    return;
+  }
+  if (msg.type === "hello_err") {
+    clearTimeout(helloTimer);
+    // Wrong token: the bridge may have rotated it. Re-fetch ONCE and retry;
+    // if that also fails, surface "failed" but keep the reconnect loop alive
+    // so a later rotation/install fix self-heals.
+    (async () => {
+      authToken = await fetchToken();
+      if (authToken) {
+        log("bridge refused the token - fetched a fresh one, reconnecting");
+        try { ws.close(); } catch {}
+      } else {
+        log("bridge refused the token and no token endpoint answered");
+        authState = "failed";
+        connected = false;
+        failAllPending("bridge auth failed");
+        broadcastStatus();
+        try { ws.close(); } catch {}
+        scheduleReconnect();
+      }
+    })();
+    return;
+  }
+  if (msg.type === "connected" && authState === "pending") {
+    // The snapshot arrived BEFORE hello_ok -> the peer never gates on auth:
+    // this is an OLD bridge. Mark legacy and carry on exactly as pre-auth
+    // builds did (compat: new extension + old bridge).
+    clearTimeout(helloTimer);
+    authState = "legacy";
+    connected = true;
+    lastMessageAt = Date.now();
+    log("old bridge without auth detected - continuing in legacy mode");
+    startHeartbeat();
+    broadcastStatus();
+    // fall through to the normal "connected" handling below
+  }
   if ("studio" in msg && (typeof msg.studio === "boolean" || msg.studio === null)) {
     studioConnected = msg.studio;
   }
@@ -256,10 +363,10 @@ function handleBridgeMessage(msg) {
     return;
   }
   if (msg.type === "server_changed") {
-    // The bridge acks, then restarts itself to reload config.json. The socket
-    // will drop right after this - the content script shows a spinner until the
-    // reconnect lands and a fresh status arrives.
-    resolvePending(msg.id, { ok: !!msg.ok, error: msg.error, restarting: !!msg.restarting });
+    // Live add/remove: the bridge no longer restarts itself (restarting:false),
+    // so the socket stays up and a fresh "connected" broadcast follows once the
+    // new server settles. restarting:true is still honoured for old bridges.
+    resolvePending(msg.id, { ok: !!msg.ok, error: msg.error, warning: msg.warning, restarting: !!msg.restarting });
     return;
   }
   if (msg.type === "error") {
@@ -286,7 +393,7 @@ function failAllPending(reason) {
 
 // ── status push to any open DeepSeek tab + popup ─────────────────────────
 function statusObj() {
-  return { type: "zs-status", connected, mcpAlive, studio: studioConnected, studioApp, studioProc, tools: toolsCache.length, servers: serversCache };
+  return { type: "zs-status", connected, authState, mcpAlive, studio: studioConnected, studioApp, studioProc, tools: toolsCache.length, servers: serversCache };
 }
 
 function broadcastStatus() {

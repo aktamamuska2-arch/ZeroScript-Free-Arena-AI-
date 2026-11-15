@@ -83,6 +83,31 @@ Go to https://chat.deepseek.com (recommended), https://chatgpt.com, https://gemi
 - Control play-testing
 - **Remember your project across sessions** persistent project memory saved inside your place
 
+## Using ZeroScript with Blender (experimental)
+
+ZeroScript is built for Roblox Studio, but it can also drive **Blender** through an addon MCP server alongside Roblox Studio. It works the same way: the AI in your chat writes commands, ZeroScript runs them on your PC through the bridge.
+
+1. **Install the uv package manager** (the Blender server is launched with `uvx`): follow the instructions at [docs.astral.sh/uv](https://docs.astral.sh/uv/getting-started/installation/) for your OS.
+2. **Open the ZeroScript menu** in any supported AI chat (Start a session first, then click the **⋯** button), scroll to **MCP servers**, click the **Blender** preset, then press **Add server** twice (the second click confirms the exact command - it will run on your PC). The bridge connects to it live - no restart. The first connect can take about a minute while uv downloads the pinned server package (`mcp-for-blender@2.3.0`). To update the pin later, change the `@version` in the preset's command after checking the release notes at github.com/ahujasid/mcp-for-blender.
+3. **Enable the MCP for Blender add-on inside Blender:** run `uvx mcp-for-blender install-addon` in a terminal, then in Blender go to **Edit > Preferences > Add-ons** and enable **Interface: MCP for Blender**. Start the add-on's connection from its sidebar panel and keep Blender open while you use it.
+4. Ask for what you want built. The AI discovers Blender's commands on its own through `list_mcp_servers` and `list_commands`.
+
+Notes:
+
+- Both tools stay connected at once: Roblox Studio is the primary server, Blender is an addon - asking about Blender automatically routes to it.
+- **Safe mode is on by default** (the preset sets `BLENDER_MCP_SAFE_MODE=1`): the Blender MCP server itself rejects hostile Python (eval/exec/os/subprocess/network/persistence) before anything reaches Blender, verified in the package's source (v2.3.0). ZeroScript additionally shows a **consent dialog** the first time the AI wants to run code through Blender (and once per session at most after "Allow all session") - the prompt is rendered by ZeroScript, never asked through the AI site. Telemetry collection in the package is kept off via `DISABLE_TELEMETRY`.
+- The panel shows Blender's health next to Roblox Studio's. A red dot with a reason (uv missing, Blender closed, add-on not started) names the exact fix.
+
+### Known limitations of the Blender integration (documented honestly)
+
+- The MCP for Blender add-on does **not** wrap each AI action in an undo step (verified in its source, v2.3.0): to revert AI changes, use Blender's undo (Ctrl+Z repeatedly) or reopen without saving.
+- The add-on's own local socket (port 9876) accepts commands from any local process regardless of safe mode - that is the package's design, outside ZeroScript's control.
+- A long render/bake blocks its tool call until done (the package has no progress events) - ask for small renders or poll job tools where provided.
+
+## Bridge security
+
+The bridge listens on `ws://127.0.0.1:17613` on YOUR machine only. It authenticates every connection: WebSocket clients must present a per-install token (stored in `bridge_auth.json` next to the bridge, created automatically) as the first message, and the handshake additionally rejects any web page's origin (a page in your browser cannot connect or read the token) plus any non-loopback Host header. Rotation: delete `bridge_auth.json` and restart the bridge (the extension re-pairs automatically), or send `GET http://127.0.0.1:17613/zs-auth/rotate` from an extension context. A process running as your own OS user is inside this trust boundary and can read the token file - the boundary is your user account, exactly like the rest of the bridge.
+
 ## New in 1.5.5
 
 - **DeepSeek: the agent starts again on the new unified model.** DeepSeek merged Instant, Expert and Vision into one model and removed the model picker, which left "Start Roblox agent" stuck on "DeepSeek mode not ready". ZeroScript now recognises the new chat box, switches Search off and starts, with DeepThink left on.
